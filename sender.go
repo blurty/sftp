@@ -8,64 +8,74 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
 const (
 	defaultBlockNum  = 5
 	maxBlockNum      = 10
-	defaultBlockSize = 516
-	minBlockSize     = 516
+	defaultBlockSize = 512
+	minBlockSize     = 512
 	maxBlockSize     = 65464
 )
 
 type blocker struct {
-	id    uint16 // block id
-	size  int    // block size
-	used  bool   // block in use
-	data  []byte // data in block
-	retry *backoff
-	timer *time.Timer
+	id    uint16   // block id
+	size  int      // actual data length in block (header + body)
+	used  bool     // block in flight, waiting for ACK
+	data  []byte   // data buffer: [opcode(2) + blockID(2) + body(blksize)]
+	retry *backoff // retry state for this block
 }
 
-// implement io.Writer interface
-func (b *blocker) Write(p []byte) (n int, err error) { return }
+// Write implements io.Writer interface
+func (b *blocker) Write(p []byte) (n int, err error) {
+	initBlockHeader(b.data, b.id)
+	n = copy(b.data[blockHeaderLength:], p)
+	if n > 0 {
+		b.used = true
+		b.size = blockHeaderLength + n
+	}
+	return n, nil
+}
 
-// implement io.ReaderFrom
+// ReadFrom implements io.ReaderFrom, reads one block of data from r
 func (b *blocker) ReadFrom(r io.Reader) (n int64, err error) {
 	initBlockHeader(b.data, b.id)
 	bn, err := r.Read(b.data[blockHeaderLength:])
-	if err == nil {
+	b.size = blockHeaderLength + bn // always update size to avoid stale data
+	if bn > 0 {
 		b.used = true
-		b.size = blockHeaderLength + bn
 	}
 	return int64(bn), err
 }
 
 var (
-	noPermissionError   = errors.New("no permission to read or write file")
-	fileNotExistError   = errors.New("file does not exist")
-	fileNotSame         = errors.New("file not same")
-	serverInternalError = errors.New("server internal error occurred")
-	timeoutError        = errors.New("handle transmission timeout")
+	errNoPermission   = errors.New("no permission to read or write file")
+	errFileNotExist   = errors.New("file does not exist")
+	errFileNotSame    = errors.New("file not same")
+	errServerInternal = errors.New("server internal error occurred")
+	errTimeout        = errors.New("handle transmission timeout")
 )
 
 type sender struct {
-	blockNum     int // block numbers for sending while waiting for ack
+	mu           sync.Mutex
+	blockNum     int // number of blocks in the sliding window
 	blocks       []*blocker
 	conn         *net.UDPConn
 	addr         *net.UDPAddr
 	localIP      net.IP
-	receive      []byte
+	send         []byte // buffer for control packets (handshake, error, OACK)
+	receive      []byte // buffer for received packets
 	receivedSize int
 	tid          int
 	retry        *backoff
 	timeout      time.Duration
 	retries      int
-	mode         string
 	opts         options
 	file         *Filer
 	opcode       uint16
+	done         chan struct{} // signal to stop background goroutines
 }
 
 func (s *sender) setBlockNum(num int) {
@@ -74,6 +84,11 @@ func (s *sender) setBlockNum(num int) {
 	}
 	s.blockNum = num
 	s.blocks = make([]*blocker, num)
+	for i := 0; i < num; i++ {
+		s.blocks[i] = &blocker{
+			retry: &backoff{},
+		}
+	}
 }
 
 func (s *sender) setBlockSize(blksize int) {
@@ -93,122 +108,116 @@ func (s *sender) SetSize(n int64) {
 	}
 }
 
-// used by client side to establish a connection with server
+// shakeHands establishes a connection with the server (client side).
+// It sends a RRQ/WRQ request and processes the server's response.
 func (s *sender) shakeHands() error {
 	info, err := json.Marshal(s.file)
 	if err != nil {
 		return err
 	}
-	n := packRQ(s.blocks[0].data, s.opcode, info, s.opts)
+	n := packRQ(s.send, s.opcode, info, s.opts)
 	s.retry.reset()
 	for {
-		s.sendDatagram(s.blocks[0].data[:n])
+		s.sendDatagram(s.send[:n])
 		err := s.recvDatagram()
 		if err != nil {
 			if s.retry.count() < s.retries {
 				s.retry.backoff()
 				continue
-			} else {
-				return err
 			}
+			return err
 		}
-		// begin parse hand-shake package
+		// parse hand-shake response
 		res, err := parsePacket(s.receive[:s.receivedSize])
 		if err != nil {
 			return err
 		}
 		if s.opcode == opRRQ {
-			if ackData, ok := res.(pRRQ); ok {
-				// check filename, filesize, filemd5, result
-				// if filename equals, but other not equal, return error
-				fdata, opts, err := unpackRRQ(ackData)
-				if err != nil {
-					return err
-				}
-				s.dealOpts(opts)
-				var fi Filer
-				err = json.Unmarshal(fdata, &fi)
-				if err != nil {
-					return err
-				}
-				if fi.Filename != s.file.Filename {
-					return serverInternalError
-				}
-				switch fi.ACK {
-				case ackNPermit:
-					s.file.State = stateNO
-					return noPermissionError
-				case ackNExist:
-					s.file.State = stateNO
-					return fileNotExistError
-				case ackNSame:
-					s.file.State = stateNO
-					info, _ = json.Marshal(s.file)
-					n = packRQ(s.blocks[0].data, s.opcode, info, nil)
-					s.sendDatagram(s.blocks[0].data[:n])
-					return fileNotSame
-				case ackSame:
-					s.file.State = stateYES
-					info, _ = json.Marshal(s.file)
-					n = packRQ(s.blocks[0].data, s.opcode, info, nil)
-					s.sendDatagram(s.blocks[0].data[:n])
-					return nil
-				}
-			} else {
+			ackData, ok := res.(pRRQ)
+			if !ok {
 				s.retry.backoff()
 				continue
+			}
+			fdata, opts, err := unpackRRQ(ackData)
+			if err != nil {
+				return err
+			}
+			s.dealOpts(opts)
+			var fi Filer
+			if err = json.Unmarshal(fdata, &fi); err != nil {
+				return err
+			}
+			if fi.Filename != s.file.Filename {
+				return errServerInternal
+			}
+			switch fi.ACK {
+			case ackNPermit:
+				s.file.State = stateNO
+				return errNoPermission
+			case ackNExist:
+				s.file.State = stateNO
+				return errFileNotExist
+			case ackNSame:
+				s.file.State = stateNO
+				info, _ = json.Marshal(s.file)
+				n = packRQ(s.send, s.opcode, info, nil)
+				s.sendDatagram(s.send[:n])
+				return errFileNotSame
+			case ackSame:
+				s.file.State = stateYES
+				info, _ = json.Marshal(s.file)
+				n = packRQ(s.send, s.opcode, info, nil)
+				s.sendDatagram(s.send[:n])
+				return nil
 			}
 		} else if s.opcode == opWRQ {
-			if ackData, ok := res.(pWRQ); ok {
-				// check filename, filesize, filemd5, result
-				// if filename equals, but other not equal, return error
-				fdata, opts, err := unpackWRQ(ackData)
-				if err != nil {
-					return err
-				}
-				s.dealOpts(opts)
-				var fi Filer
-				err = json.Unmarshal(fdata, &fi)
-				if err != nil {
-					return err
-				}
-				if fi.Filename != s.file.Filename {
-					return serverInternalError
-				}
-				switch fi.ACK {
-				case ackNPermit:
-					s.file.State = stateNO
-					return noPermissionError
-				case ackNExist:
-					s.file.State = stateYES
-					return nil
-				case ackNSame:
-					s.file.State = stateYES
-					if isHalfFiler(*s.file, fi) {
-						s.file.StartIndex = fi.FileSize + 1
-					} else {
-						s.file.StartIndex = 0
-					}
-					info, _ = json.Marshal(s.file)
-					n = packRQ(s.blocks[0].data, s.opcode, info, nil)
-					s.sendDatagram(s.blocks[0].data[:n])
-					return nil
-				case ackSame:
-					s.file.State = stateComplete
-					return nil
-				}
-			} else {
+			ackData, ok := res.(pWRQ)
+			if !ok {
 				s.retry.backoff()
 				continue
 			}
+			fdata, opts, err := unpackWRQ(ackData)
+			if err != nil {
+				return err
+			}
+			s.dealOpts(opts)
+			var fi Filer
+			if err = json.Unmarshal(fdata, &fi); err != nil {
+				return err
+			}
+			if fi.Filename != s.file.Filename {
+				return errServerInternal
+			}
+			switch fi.ACK {
+			case ackNPermit:
+				s.file.State = stateNO
+				return errNoPermission
+			case ackNExist:
+				s.file.State = stateYES
+				return nil
+			case ackNSame:
+				s.file.State = stateYES
+				if isHalfFiler(*s.file, fi) {
+					s.file.StartIndex = fi.FileSize + 1
+				} else {
+					s.file.StartIndex = 0
+				}
+				info, _ = json.Marshal(s.file)
+				n = packRQ(s.send, s.opcode, info, nil)
+				s.sendDatagram(s.send[:n])
+				return nil
+			case ackSame:
+				s.file.State = stateComplete
+				return nil
+			}
 		} else {
-			return serverInternalError
+			return errServerInternal
 		}
 		return nil
 	}
 }
 
-// send file contents
+// sendContents reads file data and sends blocks with a sliding window.
 func (s *sender) sendContents() error {
 	fp, err := os.Open(s.file.Filename)
 	if err != nil {
@@ -216,80 +225,209 @@ func (s *sender) sendContents() error {
 	}
 	defer fp.Close()
 
-	// waiting acks for each block
-	go s.recvACKs()
+	// seek to start position for resume
+	if s.file.StartIndex > 0 {
+		if _, err := fp.Seek(s.file.StartIndex, io.SeekStart); err != nil {
+			return err
+		}
+	}
 
-	var blockID uint16 = 1 // start data transmission with block 1
-	for {
-		for i := 0; i < s.blockNum && !s.blocks[i].used; i++ {
+	return s.sendFromReader(fp)
+}
+
+// sendFromReader reads data from r and sends it in blocks with ACK handling.
+func (s *sender) sendFromReader(r io.Reader) error {
+	s.done = make(chan struct{})
+	var recvErr error
+	var wg sync.WaitGroup
+
+	// start ACK receiver goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recvErr = s.recvACKLoop()
+	}()
+
+	var blockID uint16 = 1
+	eof := false
+
+	for !eof {
+		sent := false
+		for i := 0; i < s.blockNum; i++ {
+			s.mu.Lock()
+			used := s.blocks[i].used
+			s.mu.Unlock()
+			if used {
+				continue
+			}
+
 			s.blocks[i].id = blockID
-			n, err := io.Copy(s.blocks[i], fp)
-			if err == io.EOF { // end of file
-				// check each block acked
-				return nil
+			_, err := s.blocks[i].ReadFrom(r)
+			if err == io.EOF {
+				// EOF returned: block may have 0 or more data bytes.
+				// In TFTP, a block shorter than blksize signals EOF.
+				s.blocks[i].used = true
+				s.blocks[i].retry.reset()
+				s.sendOneBlock(i)
+				blockID++
+				eof = true
+				break
 			} else if err != nil {
+				close(s.done)
+				wg.Wait()
 				return err
 			}
-			s.blocks[i].used = true
 			s.blocks[i].retry.reset()
-			s.blocks[i].timer = time.NewTimer(time.Duration(s.timeout))
-			go s.sendBlock(i)
+			s.sendOneBlock(i)
 			blockID++
+			sent = true
+			// In TFTP, a short block (data < blksize) signals EOF.
+			if s.blocks[i].size < len(s.blocks[i].data) {
+				eof = true
+				break
+			}
+		}
+		if !sent && !eof {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-}
 
-// send block data
-func (s *sender) sendBlock(i int) {
-	s.conn.WriteToUDP(s.blocks[i].data[:s.blocks[i].size], s.addr)
-	// check timeout
-	select {
-	case <-s.blocks[i].timer.C:
-		if s.blocks[i].retry.count() < s.retries {
-			s.blocks[i].retry.attemp++
-			s.blocks[i].timer.Reset(time.Duration(s.timeout))
-			s.sendBlock(i)
-		} else {
-			// stop all transfer
-		}
-	}
-}
-
-// receive acks
-func (s *sender) recvACKs() {
+	// wait for all in-flight blocks to be ACKed
+	deadline := time.After(time.Duration(s.retries+1) * s.timeout)
 	for {
-		err := s.recvDatagram()
+		allDone := true
+		s.mu.Lock()
+		for i := 0; i < s.blockNum; i++ {
+			if s.blocks[i].used {
+				allDone = false
+				break
+			}
+		}
+		s.mu.Unlock()
+		if allDone {
+			break
+		}
+		select {
+		case <-deadline:
+			close(s.done)
+			wg.Wait()
+			return errTimeout
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	close(s.done)
+	wg.Wait()
+	if recvErr != nil {
+		return recvErr
+	}
+	return nil
+}
+
+// sendOneBlock sends a single data block to the remote peer.
+func (s *sender) sendOneBlock(i int) {
+	s.conn.WriteToUDP(s.blocks[i].data[:s.blocks[i].size], s.addr)
+}
+
+// recvACKLoop receives ACK packets and marks blocks as free.
+// It also handles retransmission on timeout.
+func (s *sender) recvACKLoop() error {
+	for {
+		select {
+		case <-s.done:
+			return nil
+		default:
+		}
+
+		err := s.conn.SetReadDeadline(time.Now().Add(s.timeout))
+		if err != nil {
+			return err
+		}
+		n, addr, err := s.conn.ReadFromUDP(s.receive)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.retransmitBlocks()
+				continue
+			}
+			// check if we were told to stop
+			select {
+			case <-s.done:
+				return nil
+			default:
+			}
+			continue
+		}
+		if !addr.IP.Equal(s.addr.IP) || (s.tid != 0 && addr.Port != s.tid) {
+			continue
+		}
+		s.tid = addr.Port
+
+		res, err := parsePacket(s.receive[:n])
 		if err != nil {
 			continue
 		}
-		res, err := parsePacket(s.receive[:s.receivedSize])
-		if err != nil {
-			continue
-		}
-		if ackData, ok := res.(pACK); ok {
-			id := ackData.block()
+
+		switch p := res.(type) {
+		case pACK:
+			id := p.block()
+			s.mu.Lock()
 			for i := 0; i < s.blockNum; i++ {
-				if s.blocks[i].id == id {
+				if s.blocks[i].used && s.blocks[i].id == id {
 					s.blocks[i].used = false
-					s.blocks[i].timer.Stop()
 					break
 				}
 			}
+			s.mu.Unlock()
+		case pERROR:
+			return fmt.Errorf("remote error: code=%d, message=%s", p.code(), p.message())
 		}
-		// abort
 	}
 }
 
-// deal with options
-func (s *sender) dealOpts(opts options) {}
+// retransmitBlocks resends all in-flight blocks that haven't been ACKed.
+func (s *sender) retransmitBlocks() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := 0; i < s.blockNum; i++ {
+		if s.blocks[i].used {
+			if s.blocks[i].retry.count() < s.retries {
+				s.blocks[i].retry.attemp++
+				s.conn.WriteToUDP(s.blocks[i].data[:s.blocks[i].size], s.addr)
+			}
+		}
+	}
+}
+
+// dealOpts processes negotiated options from the remote peer.
+func (s *sender) dealOpts(opts options) {
+	if opts == nil {
+		return
+	}
+	for name, value := range opts {
+		switch name {
+		case "blksize":
+			blksize, err := strconv.Atoi(value)
+			if err != nil {
+				continue
+			}
+			s.setBlockSize(blksize)
+		case "tsize":
+			if s.opts == nil {
+				s.opts = make(options)
+			}
+			s.opts["tsize"] = value
+		}
+	}
+}
 
 func (s *sender) sendRQ() error {
 	info, err := json.Marshal(s.file)
 	if err != nil {
 		return err
 	}
-	n := packRQ(s.blocks[0].data, s.opcode, info, s.opts)
-	s.sendDatagram(s.blocks[0].data[:n])
+	n := packRQ(s.send, s.opcode, info, s.opts)
+	s.sendDatagram(s.send[:n])
 	return nil
 }
 
@@ -303,9 +441,7 @@ func (s *sender) sendOptions() error {
 			}
 			s.setBlockSize(blksize)
 		} else if name == "tsize" {
-			if value != "0" {
-				s.opts["tsize"] = value
-			} else {
+			if value == "0" {
 				delete(s.opts, name)
 			}
 		} else {
@@ -313,10 +449,10 @@ func (s *sender) sendOptions() error {
 		}
 	}
 	if len(s.opts) > 0 {
-		m := packOACK(s.blocks[0].data, s.opts)
+		m := packOACK(s.send, s.opts)
 		s.retry.reset()
 		for {
-			err := s.sendDatagram(s.blocks[0].data[:m])
+			err := s.sendDatagram(s.send[:m])
 			if err != nil {
 				return err
 			}
@@ -334,7 +470,6 @@ func (s *sender) sendOptions() error {
 							if name == "blksize" {
 								blksize, err := strconv.Atoi(value)
 								if err != nil {
-									delete(s.opts, name)
 									continue
 								}
 								s.setBlockSize(blksize)
@@ -354,9 +489,106 @@ func (s *sender) sendOptions() error {
 	return nil
 }
 
-// read file from r, and write data to server
+// ReadFrom reads from r and sends data blocks to the remote peer.
+// This is used on the server side to handle RRQ (read requests).
 func (s *sender) ReadFrom(r io.Reader) (int64, error) {
-	return 0, nil
+	if s.opts != nil {
+		err := s.sendOptions()
+		if err != nil {
+			s.abort(err)
+			return 0, err
+		}
+	}
+	s.setBlockNum(defaultBlockNum)
+	s.setBlockSize(defaultBlockSize)
+
+	s.done = make(chan struct{})
+	var totalSent int64
+	var recvErr error
+	var wg sync.WaitGroup
+
+	// start ACK receiver
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recvErr = s.recvACKLoop()
+	}()
+
+	var blockID uint16 = 1
+	eof := false
+
+	for !eof {
+		sent := false
+		for i := 0; i < s.blockNum; i++ {
+			s.mu.Lock()
+			used := s.blocks[i].used
+			s.mu.Unlock()
+			if used {
+				continue
+			}
+
+			s.blocks[i].id = blockID
+			n, err := s.blocks[i].ReadFrom(r)
+			totalSent += n
+			if err == io.EOF {
+				s.blocks[i].used = true
+				s.blocks[i].retry.reset()
+				s.sendOneBlock(i)
+				blockID++
+				eof = true
+				break
+			} else if err != nil {
+				close(s.done)
+				wg.Wait()
+				s.abort(err)
+				return totalSent, err
+			}
+			s.blocks[i].retry.reset()
+			s.sendOneBlock(i)
+			blockID++
+			sent = true
+			// In TFTP, a short block (data < blksize) signals EOF.
+			if s.blocks[i].size < len(s.blocks[i].data) {
+				eof = true
+				break
+			}
+		}
+		if !sent && !eof {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// wait for all in-flight blocks to be ACKed
+	deadline := time.After(time.Duration(s.retries+1) * s.timeout)
+	for {
+		allDone := true
+		s.mu.Lock()
+		for i := 0; i < s.blockNum; i++ {
+			if s.blocks[i].used {
+				allDone = false
+				break
+			}
+		}
+		s.mu.Unlock()
+		if allDone {
+			break
+		}
+		select {
+		case <-deadline:
+			close(s.done)
+			wg.Wait()
+			return totalSent, errTimeout
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	close(s.done)
+	wg.Wait()
+	if recvErr != nil {
+		return totalSent, recvErr
+	}
+	return totalSent, nil
 }
 
 func (s *sender) recvDatagram() error {
@@ -372,6 +604,7 @@ func (s *sender) recvDatagram() error {
 		return fmt.Errorf("datagram not wanted")
 	}
 	s.tid = addr.Port
+	s.addr = addr // update to server's new transfer address (TID)
 	s.receivedSize = n
 	return nil
 }
@@ -389,7 +622,7 @@ func (s *sender) abort(err error) error {
 		s.conn.Close()
 		s.conn = nil
 	}()
-	n := packERROR(s.blocks[0].data, 1, err.Error())
-	_, err = s.conn.WriteToUDP(s.blocks[0].data[:n], s.addr)
-	return err
+	n := packERROR(s.send, 1, err.Error())
+	_, wErr := s.conn.WriteToUDP(s.send[:n], s.addr)
+	return wErr
 }

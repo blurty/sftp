@@ -54,7 +54,7 @@ func packRQ(p []byte, opcode uint16, fileinfo []byte, opts options) int {
 func unpackRQ(p []byte) (fileinfo []byte, opts options, err error) {
 	bs := bytes.Split(p[2:], []byte{0})
 	if len(bs) < 1 {
-		return nil, nil, fmt.Errorf("mssing filename")
+		return nil, nil, fmt.Errorf("missing filename")
 	}
 	fileinfo = bs[0]
 	if len(bs) < 3 {
@@ -85,7 +85,7 @@ func unpackWRQ(p pWRQ) (fileinfo []byte, opts options, err error) {
 type pOACK []byte
 
 func packOACK(p []byte, opts options) int {
-	binary.BigEndian.PutUint16(p, opACK)
+	binary.BigEndian.PutUint16(p, opOACK)
 	n := 2
 	for name, value := range opts {
 		n += copy(p[n:], name)

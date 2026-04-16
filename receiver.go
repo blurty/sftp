@@ -23,7 +23,6 @@ type receiver struct {
 	l        int
 	dally    bool
 	autoTerm bool
-	mode     string
 	opts     options
 }
 
@@ -96,7 +95,7 @@ func (r *receiver) setBlockSize(blksize string) error {
 		return fmt.Errorf("blksize too small: %d", n)
 	}
 	if n > maxBlockSize {
-		return fmt.Errorf("blksize tool large: %d", n)
+		return fmt.Errorf("blksize too large: %d", n)
 	}
 	r.receive = make([]byte, n+4)
 	return nil

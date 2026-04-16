@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -90,11 +91,9 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 		return err
 	}
 	s.conn = conn
-	// Having seperate control paths for IP4 and IP6 is annoying,
-	// but necessary at this point
 	addr := net.ParseIP(host)
 	if addr == nil {
-		return fmt.Errorf("Failed to determine IP class of listening address")
+		return fmt.Errorf("failed to determine IP class of listening address")
 	}
 	var conn4 *ipv4.PacketConn
 	var conn6 *ipv6.PacketConn
@@ -131,14 +130,6 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 	}
 }
 
-// Yes, I don't really like having seperate IPv4 and IPv6 variants,
-// but we are relying on the low-level packet control channel info to
-// get a reliable source address, and those have different types and
-// the struct itself is not easily interface-ized or embedded.
-//
-// If control is nil for whatever reason (either things not being
-// implemented on a target OS or whatever other reason), localIP
-// (and hence LocalIP()) will return a nil IP address.
 func (s *Server) processRequest4(conn4 *ipv4.PacketConn) error {
 	buf := make([]byte, datagramLength)
 	cnt, control, srcAddr, err := conn4.ReadFrom(buf)
@@ -165,7 +156,6 @@ func (s *Server) processRequest6(conn6 *ipv6.PacketConn) error {
 	return s.handlePacket(localAddr, srcAddr.(*net.UDPAddr), buf, cnt)
 }
 
-// Fallback if we had problems opening a ipv4/6 control channel
 func (s *Server) processRequest() error {
 	buf := make([]byte, datagramLength)
 	cnt, srcAddr, err := s.conn.ReadFromUDP(buf)
@@ -192,32 +182,43 @@ func (s *Server) handlePacket(localAddr net.IP, remoteAddr *net.UDPAddr, buffer 
 	}
 	switch p := p.(type) {
 	case pWRQ:
-		filename, mode, opts, err := unpackRQ(p)
+		fileinfo, opts, err := unpackRQ(p)
 		if err != nil {
 			return fmt.Errorf("unpack WRQ: %v", err)
 		}
-		//fmt.Printf("got WRQ (filename=%s, mode=%s, opts=%v)\n", filename, mode, opts)
+		var fi Filer
+		if err := json.Unmarshal(fileinfo, &fi); err != nil {
+			return fmt.Errorf("unmarshal file info: %v", err)
+		}
+		filename := fi.Filename
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 		if err != nil {
 			return err
 		}
-		if err != nil {
-			return fmt.Errorf("open transmission: %v", err)
-		}
-		wt := &receiver{
-			send:    make([]byte, datagramLength),
-			receive: make([]byte, datagramLength),
-			conn:    conn,
-			retry:   &backoff{handler: s.backoff},
-			timeout: s.timeout,
-			retries: s.retries,
-			addr:    remoteAddr,
-			localIP: localAddr,
-			mode:    mode,
-			opts:    opts,
-		}
 		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
+
+			// --- server-side WRQ handshake ---
+			proceed, err := s.doWRQHandshake(conn, remoteAddr, fi)
+			if err != nil || !proceed {
+				conn.Close()
+				return
+			}
+
+			// handshake passed, create receiver and handle write
+			// receiver's terminate() or abort() will close conn
+			wt := &receiver{
+				send:    make([]byte, datagramLength),
+				receive: make([]byte, datagramLength),
+				conn:    conn,
+				retry:   &backoff{handler: s.backoff},
+				timeout: s.timeout,
+				retries: s.retries,
+				addr:    remoteAddr,
+				localIP: localAddr,
+				opts:    opts,
+			}
 			if s.writeHandler != nil {
 				err := s.writeHandler(filename, wt)
 				if err != nil {
@@ -228,33 +229,46 @@ func (s *Server) handlePacket(localAddr net.IP, remoteAddr *net.UDPAddr, buffer 
 			} else {
 				wt.abort(fmt.Errorf("server does not support write requests"))
 			}
-			s.wg.Done()
 		}()
 	case pRRQ:
-		filename, mode, opts, err := unpackRQ(p)
+		fileinfo, opts, err := unpackRQ(p)
 		if err != nil {
 			return fmt.Errorf("unpack RRQ: %v", err)
 		}
-		//fmt.Printf("got RRQ (filename=%s, mode=%s, opts=%v)\n", filename, mode, opts)
+		var fi Filer
+		if err := json.Unmarshal(fileinfo, &fi); err != nil {
+			return fmt.Errorf("unmarshal file info: %v", err)
+		}
+		filename := fi.Filename
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 		if err != nil {
 			return err
 		}
-		rf := &sender{
-			send:    make([]byte, datagramLength),
-			receive: make([]byte, datagramLength),
-			tid:     remoteAddr.Port,
-			conn:    conn,
-			retry:   &backoff{handler: s.backoff},
-			timeout: s.timeout,
-			retries: s.retries,
-			addr:    remoteAddr,
-			localIP: localAddr,
-			mode:    mode,
-			opts:    opts,
-		}
 		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
+
+			// --- server-side RRQ handshake ---
+			proceed, err := s.doRRQHandshake(conn, remoteAddr, fi)
+			if err != nil || !proceed {
+				conn.Close()
+				return
+			}
+
+			// handshake passed, create sender and handle read
+			// sender's abort() will close conn
+			rf := &sender{
+				send:    make([]byte, datagramLength),
+				receive: make([]byte, datagramLength),
+				tid:     remoteAddr.Port,
+				conn:    conn,
+				retry:   &backoff{handler: s.backoff},
+				timeout: s.timeout,
+				retries: s.retries,
+				addr:    remoteAddr,
+				localIP: localAddr,
+				opts:    opts,
+			}
 			if s.readHandler != nil {
 				err := s.readHandler(filename, rf)
 				if err != nil {
@@ -263,10 +277,111 @@ func (s *Server) handlePacket(localAddr net.IP, remoteAddr *net.UDPAddr, buffer 
 			} else {
 				rf.abort(fmt.Errorf("server does not support read requests"))
 			}
-			s.wg.Done()
 		}()
 	default:
 		return fmt.Errorf("unexpected %T", p)
 	}
 	return nil
+}
+
+// doWRQHandshake performs the server-side WRQ handshake.
+// It checks the local file status, sends a WRQ response with ACK code,
+// and waits for client confirmation if needed.
+// Returns (true, nil) if data transfer should proceed.
+func (s *Server) doWRQHandshake(conn *net.UDPConn, remoteAddr *net.UDPAddr, clientFile Filer) (bool, error) {
+	response := checkFileForWrite(clientFile)
+	responseInfo, err := json.Marshal(response)
+	if err != nil {
+		return false, err
+	}
+	sendBuf := make([]byte, datagramLength)
+	n := packRQ(sendBuf, opWRQ, responseInfo, nil)
+	if _, err := conn.WriteToUDP(sendBuf[:n], remoteAddr); err != nil {
+		return false, err
+	}
+
+	switch response.ACK {
+	case ackNPermit, ackDir:
+		return false, nil
+	case ackSame:
+		// file already exists and is identical, no transfer needed
+		return false, nil
+	case ackNExist:
+		// file doesn't exist, client will start sending data
+		return true, nil
+	case ackNSame:
+		// file differs, wait for client's confirmation with StartIndex
+		recvBuf := make([]byte, datagramLength)
+		conn.SetReadDeadline(time.Now().Add(s.timeout))
+		cn, _, err := conn.ReadFromUDP(recvBuf)
+		if err != nil {
+			return false, fmt.Errorf("waiting for WRQ confirmation: %v", err)
+		}
+		cp, err := parsePacket(recvBuf[:cn])
+		if err != nil {
+			return false, err
+		}
+		if _, ok := cp.(pWRQ); !ok {
+			return false, fmt.Errorf("expected WRQ confirmation, got %T", cp)
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("unexpected ACK code: %d", response.ACK)
+}
+
+// doRRQHandshake performs the server-side RRQ handshake.
+// It checks the local file status, sends a RRQ response with ACK code,
+// and waits for client confirmation if needed.
+// Returns (true, nil) if data transfer should proceed.
+func (s *Server) doRRQHandshake(conn *net.UDPConn, remoteAddr *net.UDPAddr, clientFile Filer) (bool, error) {
+	response := checkFileForRead(clientFile)
+	responseInfo, err := json.Marshal(response)
+	if err != nil {
+		return false, err
+	}
+	sendBuf := make([]byte, datagramLength)
+	n := packRQ(sendBuf, opRRQ, responseInfo, nil)
+	if _, err := conn.WriteToUDP(sendBuf[:n], remoteAddr); err != nil {
+		return false, err
+	}
+
+	switch response.ACK {
+	case ackNPermit, ackDir:
+		return false, nil
+	case ackNExist:
+		return false, nil
+	case ackSame:
+		// file exists, wait for client's confirmation (may contain StartIndex)
+		recvBuf := make([]byte, datagramLength)
+		conn.SetReadDeadline(time.Now().Add(s.timeout))
+		cn, _, err := conn.ReadFromUDP(recvBuf)
+		if err != nil {
+			return false, fmt.Errorf("waiting for RRQ confirmation: %v", err)
+		}
+		cp, err := parsePacket(recvBuf[:cn])
+		if err != nil {
+			return false, err
+		}
+		if _, ok := cp.(pRRQ); !ok {
+			return false, fmt.Errorf("expected RRQ confirmation, got %T", cp)
+		}
+		return true, nil
+	case ackNSame:
+		// file differs from client's copy, wait for confirmation
+		recvBuf := make([]byte, datagramLength)
+		conn.SetReadDeadline(time.Now().Add(s.timeout))
+		cn, _, err := conn.ReadFromUDP(recvBuf)
+		if err != nil {
+			return false, fmt.Errorf("waiting for RRQ confirmation: %v", err)
+		}
+		cp, err := parsePacket(recvBuf[:cn])
+		if err != nil {
+			return false, err
+		}
+		if _, ok := cp.(pRRQ); !ok {
+			return false, fmt.Errorf("expected RRQ confirmation, got %T", cp)
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("unexpected ACK code: %d", response.ACK)
 }

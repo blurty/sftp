@@ -13,6 +13,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	sentBytes, err := client.SendFile(path)
-	fmt.Printf("send file %s bytes:%d, err:%v", path, sentBytes, err)
+	err = client.SendFile(path)
+	if err != nil {
+		fmt.Printf("send file %s failed: %v\n", path, err)
+	} else {
+		fmt.Printf("send file %s succeeded\n", path)
+	}
 }

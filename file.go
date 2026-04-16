@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"crypto/md5"
+	"encoding/hex"
 	"io"
 	"os"
 )
@@ -50,11 +51,103 @@ func NewFiler(filename string) (*Filer, error) {
 	}
 	return &Filer{
 		Filename: filename,
-		MD5:      string(h.Sum(nil)),
+		MD5:      hex.EncodeToString(h.Sum(nil)),
 		FileSize: info.Size(),
 		FileMode: uint32(info.Mode().Perm()),
 		State:    stateSync,
 	}, nil
+}
+
+// checkFileForWrite checks the local file status for an incoming write request.
+// Returns a Filer with the appropriate ACK code:
+//   - ackNExist:  file does not exist on server, proceed to receive
+//   - ackSame:    file exists and is identical, no transfer needed
+//   - ackNSame:   file exists but differs, may resume
+//   - ackNPermit: no permission to write
+func checkFileForWrite(clientFile Filer) Filer {
+	response := Filer{Filename: clientFile.Filename}
+
+	info, err := os.Stat(clientFile.Filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			response.ACK = ackNExist
+			return response
+		}
+		response.ACK = ackNPermit
+		return response
+	}
+	if info.IsDir() {
+		response.ACK = ackDir
+		return response
+	}
+
+	response.FileSize = info.Size()
+	response.FileMode = uint32(info.Mode().Perm())
+
+	fp, err := os.Open(clientFile.Filename)
+	if err != nil {
+		response.ACK = ackNPermit
+		return response
+	}
+	defer fp.Close()
+	h := md5.New()
+	io.Copy(h, fp)
+	response.MD5 = hex.EncodeToString(h.Sum(nil))
+
+	if response.FileSize == clientFile.FileSize && response.MD5 == clientFile.MD5 {
+		response.ACK = ackSame
+	} else {
+		response.ACK = ackNSame
+	}
+	return response
+}
+
+// checkFileForRead checks the local file status for an incoming read request.
+// Returns a Filer with the appropriate ACK code:
+//   - ackNExist:  file does not exist on server
+//   - ackSame:    file exists (and matches client's copy if provided)
+//   - ackNSame:   file exists but differs from client's copy
+//   - ackNPermit: no permission to read
+func checkFileForRead(clientFile Filer) Filer {
+	response := Filer{Filename: clientFile.Filename}
+
+	info, err := os.Stat(clientFile.Filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			response.ACK = ackNExist
+		} else {
+			response.ACK = ackNPermit
+		}
+		return response
+	}
+	if info.IsDir() {
+		response.ACK = ackDir
+		return response
+	}
+
+	response.FileSize = info.Size()
+	response.FileMode = uint32(info.Mode().Perm())
+
+	fp, err := os.Open(clientFile.Filename)
+	if err != nil {
+		response.ACK = ackNPermit
+		return response
+	}
+	defer fp.Close()
+	h := md5.New()
+	io.Copy(h, fp)
+	response.MD5 = hex.EncodeToString(h.Sum(nil))
+
+	if clientFile.MD5 != "" && clientFile.FileSize > 0 {
+		if response.FileSize == clientFile.FileSize && response.MD5 == clientFile.MD5 {
+			response.ACK = ackSame
+		} else {
+			response.ACK = ackNSame
+		}
+	} else {
+		response.ACK = ackSame
+	}
+	return response
 }
 
 func isSameFiler(local Filer, remote Filer) bool {
@@ -75,7 +168,7 @@ func isHalfFiler(local Filer, remote Filer) bool {
 	if err != nil || n != remote.FileSize {
 		return false
 	}
-	if remote.MD5 == string(h.Sum(nil)) {
+	if remote.MD5 == hex.EncodeToString(h.Sum(nil)) {
 		return true
 	} else {
 		return false
