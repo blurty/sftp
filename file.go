@@ -3,8 +3,11 @@ package sftp
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 const (
@@ -30,6 +33,15 @@ type Filer struct {
 	FileMode   uint32 `json:"file_mode"`   // file mode
 	ACK        uint16 `json:"ack"`         // ack code for request
 	State      uint8  `json:"state"`       // tranfer state
+}
+
+// validateFilename rejects path-traversal attempts.
+func validateFilename(name string) error {
+	cleaned := filepath.Clean(name)
+	if strings.Contains(cleaned, "..") {
+		return fmt.Errorf("invalid filename: path traversal detected: %s", name)
+	}
+	return nil
 }
 
 // return a new Filer pointer
@@ -66,6 +78,11 @@ func NewFiler(filename string) (*Filer, error) {
 //   - ackNPermit: no permission to write
 func checkFileForWrite(clientFile Filer) Filer {
 	response := Filer{Filename: clientFile.Filename}
+
+	if err := validateFilename(clientFile.Filename); err != nil {
+		response.ACK = ackNPermit
+		return response
+	}
 
 	info, err := os.Stat(clientFile.Filename)
 	if err != nil {
@@ -110,6 +127,11 @@ func checkFileForWrite(clientFile Filer) Filer {
 //   - ackNPermit: no permission to read
 func checkFileForRead(clientFile Filer) Filer {
 	response := Filer{Filename: clientFile.Filename}
+
+	if err := validateFilename(clientFile.Filename); err != nil {
+		response.ACK = ackNPermit
+		return response
+	}
 
 	info, err := os.Stat(clientFile.Filename)
 	if err != nil {

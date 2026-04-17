@@ -13,23 +13,23 @@ const (
 type backoffFunc func(int) time.Duration
 
 type backoff struct {
-	attemp  int
+	attempt int
 	handler backoffFunc
 }
 
 func (b *backoff) reset() {
-	b.attemp = 0
+	b.attempt = 0
 }
 
 func (b *backoff) count() int {
-	return b.attemp
+	return b.attempt
 }
 
 func (b *backoff) backoff() {
 	if b.handler == nil {
 		time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
 	} else {
-		time.Sleep(b.handler(b.attemp))
+		time.Sleep(b.handler(b.attempt))
 	}
-	b.attemp++
+	b.attempt++
 }

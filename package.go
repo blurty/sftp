@@ -32,14 +32,22 @@ type options map[string]string
 type pRRQ []byte
 type pWRQ []byte
 
-// packRQ returns length of the packet in b
+// packRQ returns length of the packet in b.
+// Panics if the data would exceed the buffer size.
 func packRQ(p []byte, opcode uint16, fileinfo []byte, opts options) int {
 	binary.BigEndian.PutUint16(p, opcode)
 	n := 2
+	if n+len(fileinfo)+1 > len(p) {
+		panic("packRQ: fileinfo too large for buffer")
+	}
 	n += copy(p[n:], fileinfo)
 	p[n] = 0
 	n++
 	for name, value := range opts {
+		needed := len(name) + 1 + len(value) + 1
+		if n+needed > len(p) {
+			panic("packRQ: options too large for buffer")
+		}
 		n += copy(p[n:], name)
 		p[n] = 0
 		n++
@@ -88,6 +96,10 @@ func packOACK(p []byte, opts options) int {
 	binary.BigEndian.PutUint16(p, opOACK)
 	n := 2
 	for name, value := range opts {
+		needed := len(name) + 1 + len(value) + 1
+		if n+needed > len(p) {
+			panic("packOACK: options too large for buffer")
+		}
 		n += copy(p[n:], name)
 		p[n] = 0
 		n++
@@ -128,7 +140,12 @@ func (p pERROR) code() uint16 {
 }
 
 func (p pERROR) message() string {
-	return string(p[4:])
+	msg := p[4:]
+	// Strip trailing null byte(s)
+	for len(msg) > 0 && msg[len(msg)-1] == 0 {
+		msg = msg[:len(msg)-1]
+	}
+	return string(msg)
 }
 
 // DATA packet

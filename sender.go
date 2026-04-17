@@ -100,14 +100,6 @@ func (s *sender) setBlockSize(blksize int) {
 	}
 }
 
-func (s *sender) SetSize(n int64) {
-	if s.opts != nil {
-		if _, ok := s.opts["tsize"]; ok {
-			s.opts["tsize"] = strconv.FormatInt(n, 10)
-		}
-	}
-}
-
 // shakeHands establishes a connection with the server (client side).
 // It sends a RRQ/WRQ request and processes the server's response.
 func (s *sender) shakeHands() error {
@@ -121,7 +113,7 @@ func (s *sender) shakeHands() error {
 		s.sendDatagram(s.send[:n])
 		err := s.recvDatagram()
 		if err != nil {
-			if s.retry.count() < s.retries {
+			if _, ok := err.(net.Error); ok && s.retry.count() < s.retries {
 				s.retry.backoff()
 				continue
 			}
@@ -198,7 +190,7 @@ func (s *sender) shakeHands() error {
 			case ackNSame:
 				s.file.State = stateYES
 				if isHalfFiler(*s.file, fi) {
-					s.file.StartIndex = fi.FileSize + 1
+					s.file.StartIndex = fi.FileSize
 				} else {
 					s.file.StartIndex = 0
 				}
@@ -261,28 +253,35 @@ func (s *sender) sendFromReader(r io.Reader) error {
 				continue
 			}
 
-			s.blocks[i].id = blockID
-			_, err := s.blocks[i].ReadFrom(r)
+			// Prepare block outside lock (ReadFrom reads from the source).
+			// Then take lock to publish the block to recvACKLoop.
+			blk := s.blocks[i]
+			blk.id = blockID
+			_, err := blk.ReadFrom(r)
+
+			s.mu.Lock()
 			if err == io.EOF {
-				// EOF returned: block may have 0 or more data bytes.
-				// In TFTP, a block shorter than blksize signals EOF.
-				s.blocks[i].used = true
-				s.blocks[i].retry.reset()
+				blk.used = true
+				blk.retry.reset()
+				s.mu.Unlock()
 				s.sendOneBlock(i)
 				blockID++
 				eof = true
 				break
 			} else if err != nil {
+				s.mu.Unlock()
 				close(s.done)
 				wg.Wait()
 				return err
 			}
-			s.blocks[i].retry.reset()
+			blk.retry.reset()
+			blk.used = true
+			shortBlock := blk.size < len(blk.data)
+			s.mu.Unlock()
 			s.sendOneBlock(i)
 			blockID++
 			sent = true
-			// In TFTP, a short block (data < blksize) signals EOF.
-			if s.blocks[i].size < len(s.blocks[i].data) {
+			if shortBlock {
 				eof = true
 				break
 			}
@@ -327,7 +326,11 @@ func (s *sender) sendFromReader(r io.Reader) error {
 
 // sendOneBlock sends a single data block to the remote peer.
 func (s *sender) sendOneBlock(i int) {
-	s.conn.WriteToUDP(s.blocks[i].data[:s.blocks[i].size], s.addr)
+	s.mu.Lock()
+	data := make([]byte, s.blocks[i].size)
+	copy(data, s.blocks[i].data[:s.blocks[i].size])
+	s.mu.Unlock()
+	s.conn.WriteToUDP(data, s.addr)
 }
 
 // recvACKLoop receives ACK packets and marks blocks as free.
@@ -392,8 +395,10 @@ func (s *sender) retransmitBlocks() {
 	for i := 0; i < s.blockNum; i++ {
 		if s.blocks[i].used {
 			if s.blocks[i].retry.count() < s.retries {
-				s.blocks[i].retry.attemp++
-				s.conn.WriteToUDP(s.blocks[i].data[:s.blocks[i].size], s.addr)
+				s.blocks[i].retry.attempt++
+				data := make([]byte, s.blocks[i].size)
+				copy(data, s.blocks[i].data[:s.blocks[i].size])
+				s.conn.WriteToUDP(data, s.addr)
 			}
 		}
 	}
@@ -419,16 +424,6 @@ func (s *sender) dealOpts(opts options) {
 			s.opts["tsize"] = value
 		}
 	}
-}
-
-func (s *sender) sendRQ() error {
-	info, err := json.Marshal(s.file)
-	if err != nil {
-		return err
-	}
-	n := packRQ(s.send, s.opcode, info, s.opts)
-	s.sendDatagram(s.send[:n])
-	return nil
 }
 
 func (s *sender) sendOptions() error {
@@ -483,7 +478,10 @@ func (s *sender) sendOptions() error {
 				s.retry.backoff()
 				continue
 			}
-			return err
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("option negotiation failed after %d retries", s.retries)
 		}
 	}
 	return nil
@@ -499,8 +497,11 @@ func (s *sender) ReadFrom(r io.Reader) (int64, error) {
 			return 0, err
 		}
 	}
-	s.setBlockNum(defaultBlockNum)
-	s.setBlockSize(defaultBlockSize)
+	// Only set defaults if sendOptions didn't already configure them.
+	if len(s.blocks) == 0 {
+		s.setBlockNum(defaultBlockNum)
+		s.setBlockSize(defaultBlockSize)
+	}
 
 	s.done = make(chan struct{})
 	var totalSent int64
@@ -527,28 +528,35 @@ func (s *sender) ReadFrom(r io.Reader) (int64, error) {
 				continue
 			}
 
-			s.blocks[i].id = blockID
-			n, err := s.blocks[i].ReadFrom(r)
+			blk := s.blocks[i]
+			blk.id = blockID
+			n, err := blk.ReadFrom(r)
 			totalSent += n
+
+			s.mu.Lock()
 			if err == io.EOF {
-				s.blocks[i].used = true
-				s.blocks[i].retry.reset()
+				blk.used = true
+				blk.retry.reset()
+				s.mu.Unlock()
 				s.sendOneBlock(i)
 				blockID++
 				eof = true
 				break
 			} else if err != nil {
+				s.mu.Unlock()
 				close(s.done)
 				wg.Wait()
 				s.abort(err)
 				return totalSent, err
 			}
-			s.blocks[i].retry.reset()
+			blk.retry.reset()
+			blk.used = true
+			shortBlock := blk.size < len(blk.data)
+			s.mu.Unlock()
 			s.sendOneBlock(i)
 			blockID++
 			sent = true
-			// In TFTP, a short block (data < blksize) signals EOF.
-			if s.blocks[i].size < len(s.blocks[i].data) {
+			if shortBlock {
 				eof = true
 				break
 			}

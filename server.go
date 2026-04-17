@@ -30,11 +30,13 @@ type Server struct {
 	readHandler  func(filename string, rf io.ReaderFrom) error
 	writeHandler func(filename string, wt io.WriterTo) error
 	backoff      backoffFunc
+	mu           sync.Mutex
 	conn         *net.UDPConn
 	quit         chan chan struct{}
 	wg           sync.WaitGroup
 	timeout      time.Duration
 	retries      int
+	shutdownOnce sync.Once
 }
 
 // SetTimeout sets maximum time server waits for single network
@@ -90,7 +92,9 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.conn = conn
+	s.mu.Unlock()
 	addr := net.ParseIP(host)
 	if addr == nil {
 		return fmt.Errorf("failed to determine IP class of listening address")
@@ -124,7 +128,13 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 				err = s.processRequest()
 			}
 			if err != nil {
-				// TODO: add logging handler
+				// Check if we are shutting down (conn closed).
+				select {
+				case q := <-s.quit:
+					q <- struct{}{}
+					return nil
+				default:
+				}
 			}
 		}
 	}
@@ -168,10 +178,19 @@ func (s *Server) processRequest() error {
 // Shutdown make server stop listening for new requests, allows
 // server to finish outstanding transfers and stops server.
 func (s *Server) Shutdown() {
-	s.conn.Close()
-	q := make(chan struct{})
-	s.quit <- q
-	<-q
+	s.shutdownOnce.Do(func() {
+		s.mu.Lock()
+		conn := s.conn
+		s.mu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+		if s.quit != nil {
+			q := make(chan struct{})
+			s.quit <- q
+			<-q
+		}
+	})
 	s.wg.Wait()
 }
 
@@ -273,6 +292,8 @@ func (s *Server) handlePacket(localAddr net.IP, remoteAddr *net.UDPAddr, buffer 
 				err := s.readHandler(filename, rf)
 				if err != nil {
 					rf.abort(err)
+				} else {
+					rf.conn.Close()
 				}
 			} else {
 				rf.abort(fmt.Errorf("server does not support read requests"))

@@ -11,8 +11,6 @@ type Client struct {
 	timeout time.Duration
 	retries int
 	backoff backoffFunc
-	blksize int
-	tsize   bool
 }
 
 func NewClient(addr string) (*Client, error) {
@@ -41,6 +39,7 @@ func (c *Client) SendFile(filename string) error {
 	}
 	flr, err := NewFiler(filename)
 	if err != nil {
+		conn.Close()
 		return err
 	}
 	s := &sender{
@@ -58,13 +57,18 @@ func (c *Client) SendFile(filename string) error {
 	s.setBlockSize(0) // will use defaultBlockSize
 	err = s.shakeHands()
 	if err != nil {
+		conn.Close()
 		return err
 	}
 	// file already exists and is identical on server
 	if s.file.State == stateComplete {
+		conn.Close()
 		return nil
 	}
-	return s.sendContents()
+	// sendContents -> sendFromReader will use conn; abort() closes it on error
+	err = s.sendContents()
+	conn.Close()
+	return err
 }
 
 // SetTimeout sets maximum time client waits for single network round-trip to succeed.

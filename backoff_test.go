@@ -10,7 +10,7 @@ func TestBackoffResetAndCount(t *testing.T) {
 	if b.count() != 0 {
 		t.Errorf("initial count = %d, want 0", b.count())
 	}
-	b.attemp = 3
+	b.attempt = 3
 	if b.count() != 3 {
 		t.Errorf("count = %d, want 3", b.count())
 	}

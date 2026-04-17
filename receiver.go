@@ -135,6 +135,7 @@ func (r *receiver) receiveDatagram(l int) (int, *net.UDPAddr, error) {
 			return 0, addr, err
 		}
 		r.tid = addr.Port
+		r.addr = addr // update to sender's transfer address (TID)
 		switch p := p.(type) {
 		case pDATA:
 			if p.block() == r.block {
@@ -171,7 +172,10 @@ func (r *receiver) terminate() error {
 	if r.conn == nil {
 		return nil
 	}
-	defer r.conn.Close()
+	defer func() {
+		r.conn.Close()
+		r.conn = nil
+	}()
 	binary.BigEndian.PutUint16(r.send[2:4], r.block)
 	if r.dally {
 		for i := 0; i < 3; i++ {
