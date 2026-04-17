@@ -1,1 +1,11 @@
+# IDE
+.idea/
+
+# Go build output
+/client
+/server
+*.exe
+*.test
+
+# Python
 *.pyc
