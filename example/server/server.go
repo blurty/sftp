@@ -42,12 +42,17 @@ func writeHandler(filename string, wt io.WriterTo) error {
 }
 
 func main() {
+	addr := ":22345"
+	if len(os.Args) >= 2 {
+		addr = os.Args[1]
+	}
 	// use nil in place of handler to disable read or write operations
 	s := sftp.NewServer(readHandler, writeHandler)
-	s.SetTimeout(5 * time.Second)     // optional
-	err := s.ListenAndServe(":22345") // blocks until s.Shutdown() is called
+	s.SetTimeout(5 * time.Second)
+	fmt.Printf("listening on %s\n", addr)
+	err := s.ListenAndServe(addr) // blocks until s.Shutdown() is called
 	if err != nil {
-		fmt.Fprintf(os.Stdout, "server: %v\n", err)
+		fmt.Fprintf(os.Stderr, "server: %v\n", err)
 		os.Exit(1)
 	}
 }
